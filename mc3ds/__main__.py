@@ -4,6 +4,7 @@ from pathlib import Path
 import importlib.resources
 import shutil
 import json
+import logging
 
 from . import data
 
@@ -22,7 +23,14 @@ from .convert import convert
 from .nbt import NewNBT
 from .javato3ds import convert_java
 
-logging.basicConfig(filename="3dschunker.log", level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("3dschunker.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 
