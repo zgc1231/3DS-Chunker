@@ -1,9 +1,11 @@
 from pathlib import Path
 import json
 import logging
+import os
 import re
 import shutil
 import struct
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import zlib
 
 from anvil import Region, Block
@@ -170,6 +172,16 @@ def chunk_block_payload(java_chunk, inverse_block_map: dict) -> bytes:
     return bytes(data)
 
 
+def _init_chunk_worker(inverse_block_map: dict) -> None:
+    global _INVERSE_BLOCK_MAP
+    _INVERSE_BLOCK_MAP = inverse_block_map
+
+
+def _convert_chunk(java_chunk, chunk_x: int, chunk_z: int, dimension: int):
+    payload = chunk_block_payload(java_chunk, _INVERSE_BLOCK_MAP)
+    return chunk_x, chunk_z, dimension, payload
+
+
 class CdbBuilder:
     def __init__(self, output_directory: Path, chunk_status: tuple[int, int]) -> None:
         self.output_directory = Path(output_directory)
@@ -328,14 +340,47 @@ def convert_java(java_world: Path, world_out: Path, delete_out: bool) -> None:
     converted_chunks = 0
     missing_xpos_chunks = 0
 
-    for chunk, chunk_x, chunk_z, dimension, has_xpos in iter_java_chunks(java_world):
-        if not has_xpos:
-            missing_xpos_chunks += 1
-            continue
+    max_workers = max(1, (os.cpu_count() or 1) - 1)
+    logger.info("Using %d worker process(es) for Java chunk conversion", max_workers)
 
-        payload = chunk_block_payload(chunk, inverse_block_map)
-        builder.add_chunk(chunk_x, chunk_z, dimension, payload)
-        converted_chunks += 1
+    if max_workers == 1:
+        for chunk, chunk_x, chunk_z, dimension, has_xpos in iter_java_chunks(java_world):
+            if not has_xpos:
+                missing_xpos_chunks += 1
+                continue
+
+            payload = chunk_block_payload(chunk, inverse_block_map)
+            builder.add_chunk(chunk_x, chunk_z, dimension, payload)
+            converted_chunks += 1
+    else:
+        max_in_flight = max_workers * 4
+        futures = set()
+
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_chunk_worker,
+            initargs=(inverse_block_map,),
+        ) as executor:
+            for chunk, chunk_x, chunk_z, dimension, has_xpos in iter_java_chunks(java_world):
+                if not has_xpos:
+                    missing_xpos_chunks += 1
+                    continue
+
+                futures.add(
+                    executor.submit(_convert_chunk, chunk, chunk_x, chunk_z, dimension)
+                )
+
+                if len(futures) >= max_in_flight:
+                    done = next(as_completed(futures))
+                    futures.remove(done)
+                    chunk_x, chunk_z, dimension, payload = done.result()
+                    builder.add_chunk(chunk_x, chunk_z, dimension, payload)
+                    converted_chunks += 1
+
+            for done in as_completed(futures):
+                chunk_x, chunk_z, dimension, payload = done.result()
+                builder.add_chunk(chunk_x, chunk_z, dimension, payload)
+                converted_chunks += 1
 
     builder.write()
 
