@@ -10,8 +10,6 @@ import zlib
 
 from anvil import Region, Block
 
-from .convert import parse_block_json
-
 logger = logging.getLogger(__name__)
 
 OVERWORLD = 0
@@ -20,8 +18,15 @@ END = 2
 
 MAGIC_CDB = 0xABCDEF98
 FILE_HEADER_SIZE = 0x14
+SUBFILE_HEADER_SIZE = 0x4
 CHUNK_HEADER_SIZE = 0x6C
 DEFAULT_SUBFILE_SIZE = 0x2800
+DEFAULT_POINTER_COUNT = 28
+DEFAULT_INDEX_UNKNOWN0 = 0x3E04
+
+_INVERSE_BLOCK_MAP: dict | None = None
+
+BLOCK_DEF_PATTERN = re.compile(r"^([^\[\]]+)(?:\[([^\[\]]*)\])?$")
 
 
 def pos_pack(x: int, z: int, dim: int) -> int:
@@ -38,129 +43,189 @@ def block_key(block: Block) -> tuple[str, str, tuple[tuple[str, str], ...]]:
         namespace, name = "minecraft", block_id
     props = getattr(block, "properties", None)
     if not isinstance(props, dict):
-        props_dict = {}
+        props_dict: dict[str, str] = {}
     else:
         props_dict = props
     properties = tuple(sorted(props_dict.items()))
     return namespace, name, properties
 
 
-def build_inverse_block_map(blocks: dict) -> dict:
-    inverse: dict[tuple[str, str, tuple[tuple[str, str], ...]], int] = {}
-    for _id, block_def in blocks.items():
-        if isinstance(block_def, dict):
-            namespace = block_def.get("namespace")
-            name = block_def.get("name")
-            variants = block_def.get("variants", [])
-        else:
-            namespace = getattr(block_def, "namespace", None)
-            name = getattr(block_def, "name", None)
-            variants = getattr(block_def, "variants", [])
-        if not namespace or not name:
-            continue
-        for variant in variants:
-            if isinstance(variant, dict):
-                props = variant.get("properties", {})
-                var_id = variant.get("id")
-            else:
-                props = getattr(variant, "properties", {}) or {}
-                var_id = getattr(variant, "id", None)
-            if var_id is None:
-                continue
-            key = (namespace, name, tuple(sorted(props.items())))
-            if key in inverse:
-                continue
-            inverse[key] = var_id
-    return inverse
+def parse_block_definition(definition: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    matched = BLOCK_DEF_PATTERN.match(definition)
+    if matched is None:
+        raise ValueError(f"invalid block descriptor {definition!r}")
+    name = matched[1]
+    raw_props = matched[2]
+    if ":" in name:
+        namespace, block_name = name.split(":", 1)
+    else:
+        namespace, block_name = "minecraft", name
+    if raw_props:
+        props = dict(item.split("=", 1) for item in raw_props.split(","))
+    else:
+        props = {}
+    return namespace, block_name, tuple(sorted(props.items()))
 
 
-class CdbBuilder:
-    def __init__(self, output_directory: Path, chunk_status: tuple[int, int]) -> None:
-        self.output_directory = Path(output_directory)
-        self.chunk_status = chunk_status
-        self.entries: list[bytes] = []
-        self.chunk_blobs: list[tuple[bytes, int]] = []
-        self._index_by_position: dict[int, int] = {}
+def build_inverse_block_map(raw_blocks: dict) -> dict:
+    mapping: dict[tuple[str, str, tuple[tuple[str, str], ...]], tuple[int, int]] = {}
+    for numerical_id, descriptor in raw_blocks.get("blocks", {}).items():
+        namespace, name, props = parse_block_definition(descriptor)
+        id_part, data_part = numerical_id.split(":", 1)
+        mapping[(namespace, name, props)] = (int(id_part), int(data_part))
+    return mapping
+
+
+class CdbSlotBuilder:
+    def __init__(
+        self,
+        slot_index: int,
+        subfile_size: int = DEFAULT_SUBFILE_SIZE,
+        header_size: int = FILE_HEADER_SIZE,
+    ) -> None:
+        self.slot_index = slot_index
+        self.subfile_size = subfile_size
+        self.header_size = header_size
+        self.subfiles: list[bytes] = []
+
+    def add_chunk(
+        self, position: int, parameters: tuple[int, int], compressed: bytes, decompressed: int
+    ) -> int:
+        data_offset = SUBFILE_HEADER_SIZE + CHUNK_HEADER_SIZE
+        if data_offset + len(compressed) > self.subfile_size:
+            raise ValueError("chunk payload does not fit into subfile")
+
+        page = bytearray(self.subfile_size)
+        struct.pack_into("<I", page, 0x0, MAGIC_CDB)
+        offset = SUBFILE_HEADER_SIZE
+        struct.pack_into(
+            "<IbbHHH",
+            page,
+            offset,
+            position,
+            parameters[0],
+            parameters[1],
+            0,
+            3,
+            0,
+        )
+        offset += 12
+
+        sections = [
+            (0, data_offset, len(compressed), decompressed),
+            (-1, -1, 0, 0),
+            (-1, -1, 0, 0),
+            (-1, -1, 0, 0),
+            (-1, -1, 0, 0),
+            (-1, -1, 0, 0),
+        ]
+        for index, position_offset, compressed_size, decompressed_size in sections:
+            struct.pack_into(
+                "<iiii", page, offset, index, position_offset, compressed_size, decompressed_size
+            )
+            offset += 16
+
+        page[data_offset : data_offset + len(compressed)] = compressed
+        self.subfiles.append(bytes(page))
+        return len(self.subfiles) - 1
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            header = struct.pack(
+                "<HHIIII",
+                1,
+                1,
+                len(self.subfiles),
+                self.header_size,
+                self.subfile_size,
+                0x4,
+            )
+            handle.write(header)
+            if self.header_size > len(header):
+                handle.write(b"\x00" * (self.header_size - len(header)))
+            for subfile in self.subfiles:
+                if len(subfile) < self.subfile_size:
+                    handle.write(subfile)
+                    handle.write(b"\x00" * (self.subfile_size - len(subfile)))
+                else:
+                    handle.write(subfile)
+
+
+class CdbIndexBuilder:
+    def __init__(self, pointer_count: int = DEFAULT_POINTER_COUNT) -> None:
+        self.pointer_count = pointer_count
+        self.entries: list[tuple[int, int, int, tuple[int, int]]] = []
+
+    def add_entry(
+        self, position: int, slot: int, subfile: int, parameters: tuple[int, int]
+    ) -> None:
+        self.entries.append((position, slot, subfile, parameters))
+
+    def _final_pointer_count(self) -> int:
+        if not self.entries:
+            return max(self.pointer_count, 1)
+        max_slot = max(entry[1] for entry in self.entries)
+        return max(self.pointer_count, max_slot + 1)
+
+    def write(self, path: Path) -> None:
+        pointer_count = self._final_pointer_count()
+        entry_count = len(self.entries)
+        header = struct.pack(
+            "<IIIIII", 2, entry_count, DEFAULT_INDEX_UNKNOWN0, 16, pointer_count, 0x80
+        )
+        pointers = b"".join(struct.pack("<I", i) for i in range(pointer_count))
+        entries_blob = bytearray()
+        for position, slot, subfile, parameters in self.entries:
+            entries_blob.extend(
+                struct.pack(
+                    "<IHHHHbbH",
+                    position,
+                    slot,
+                    subfile,
+                    0x20FF,
+                    0x000A,
+                    parameters[0],
+                    parameters[1],
+                    0x8000,
+                )
+            )
+        payload = header + pointers + entries_blob
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(payload)
+
+
+class CdbWorldBuilder:
+    def __init__(
+        self,
+        subfile_size: int = DEFAULT_SUBFILE_SIZE,
+        pointer_count: int = DEFAULT_POINTER_COUNT,
+        chunk_parameters: tuple[int, int] = (7, 0),
+    ) -> None:
+        self.subfile_size = subfile_size
+        self.chunk_parameters = chunk_parameters
+        self.slots: dict[int, CdbSlotBuilder] = {}
+        self.index_builder = CdbIndexBuilder(pointer_count)
 
     def add_chunk(self, x: int, z: int, dimension: int, payload: bytes) -> None:
-        pos = pos_pack(x, z, dimension)
-        if pos in self._index_by_position:
-            raise ValueError(f"chunk at position {x}, {z}, {dimension} already added")
-        index = len(self.entries)
-        self._index_by_position[pos] = index
-        header = bytearray(CHUNK_HEADER_SIZE)
-        struct.pack_into("<I", header, 0x0, pos)
-        struct.pack_into("<I", header, 0x4, 0)
-        struct.pack_into("<I", header, 0x8, 0)
-        struct.pack_into("<I", header, 0xC, 0)
-        struct.pack_into("<I", header, 0x10, 0)
-        struct.pack_into("<I", header, 0x14, 0)
-        struct.pack_into("<I", header, 0x18, 0)
-        struct.pack_into("<I", header, 0x1C, 0)
-        struct.pack_into("<I", header, 0x20, 0)
-        struct.pack_into("<I", header, 0x24, 0)
-        struct.pack_into("<I", header, 0x28, 0)
-        struct.pack_into("<I", header, 0x2C, 0)
-        struct.pack_into("<I", header, 0x30, 3)
-        struct.pack_into("<I", header, 0x34, self.chunk_status[0])
-        struct.pack_into("<I", header, 0x38, self.chunk_status[1])
-        struct.pack_into("<I", header, 0x3C, 0)
-        struct.pack_into("<I", header, 0x40, 0)
-        struct.pack_into("<I", header, 0x44, 0)
-        struct.pack_into("<I", header, 0x48, 0)
-        struct.pack_into("<I", header, 0x4C, 0)
-        struct.pack_into("<I", header, 0x50, 0)
-        struct.pack_into("<I", header, 0x54, 0)
-        struct.pack_into("<I", header, 0x58, 0)
-        struct.pack_into("<I", header, 0x5C, 0)
-        struct.pack_into("<I", header, 0x60, 0)
-        struct.pack_into("<I", header, 0x64, 0)
-        struct.pack_into("<I", header, 0x68, 0)
+        position = pos_pack(x, z, dimension)
+        slot_index = 0
+        slot = self.slots.setdefault(slot_index, CdbSlotBuilder(slot_index, self.subfile_size))
         compressed = zlib.compress(payload)
-        self.entries.append(bytes(header))
-        self.chunk_blobs.append((compressed, len(payload)))
+        subfile_index = slot.add_chunk(position, self.chunk_parameters, compressed, len(payload))
+        self.index_builder.add_entry(position, slot_index, subfile_index, self.chunk_parameters)
 
-    def write(self) -> None:
-        self.output_directory.mkdir(parents=True, exist_ok=True)
-        output_path = self.output_directory / "0.cdb"
-        with open(output_path, "wb") as out:
-            self._write_file(out)
-
-    def _write_file(self, out) -> None:
-        entries_offset = FILE_HEADER_SIZE
-        chunks_offset = FILE_HEADER_SIZE + CHUNK_HEADER_SIZE * len(self.entries)
-        out.seek(0)
-        out.write(b"\x00" * FILE_HEADER_SIZE)
-        out.seek(entries_offset)
-        for entry in self.entries:
-            out.write(entry)
-        out.seek(chunks_offset)
-        chunk_offsets: list[tuple[int, int, int]] = []
-        for blob, uncompressed_size in self.chunk_blobs:
-            offset = out.tell()
-            out.write(blob)
-            size = out.tell() - offset
-            if size > 0xFFFFFFFF or offset > 0xFFFFFFFF:
-                raise ValueError("chunk data too large to write to cdb")
-            chunk_offsets.append((offset, size, uncompressed_size))
-        out.seek(0, os.SEEK_END)
-        file_size = out.tell()
-        header = bytearray(FILE_HEADER_SIZE)
-        struct.pack_into("<I", header, 0x0, MAGIC_CDB)
-        struct.pack_into("<I", header, 0x4, file_size)
-        struct.pack_into("<I", header, 0x8, 1)
-        struct.pack_into("<I", header, 0xC, 1)
-        struct.pack_into("<I", header, 0x10, len(self.entries))
-        out.seek(0)
-        out.write(header)
-        out.seek(FILE_HEADER_SIZE)
-        for i, entry in enumerate(self.entries):
-            offset, size, uncompressed_size = chunk_offsets[i]
-            patched = bytearray(entry)
-            struct.pack_into("<I", patched, 0x4, offset)
-            struct.pack_into("<I", patched, 0x8, size)
-            struct.pack_into("<I", patched, 0xC, uncompressed_size)
-            out.write(patched)
+    def write(self, output_directory: Path) -> None:
+        output_directory = Path(output_directory)
+        cdb_dir = output_directory / "db" / "cdb"
+        cdb_dir.mkdir(parents=True, exist_ok=True)
+        for slot_index, slot in sorted(self.slots.items()):
+            slot.write(cdb_dir / f"slt{slot_index}.cdb")
+        index_path = cdb_dir / "index.cdb"
+        new_index_path = cdb_dir / "newindex.cdb"
+        self.index_builder.write(index_path)
+        self.index_builder.write(new_index_path)
 
 
 def chunk_block_payload(java_chunk, inverse_block_map: dict) -> bytes:
@@ -168,7 +233,9 @@ def chunk_block_payload(java_chunk, inverse_block_map: dict) -> bytes:
     subchunk_height = 16
     width = 16
     depth = 16
-    subchunk_blocks = [bytearray(width * depth * subchunk_height) for _ in range(subchunk_count)]
+    blocks = [bytearray(width * depth * subchunk_height) for _ in range(subchunk_count)]
+    metas = [bytearray(width * depth * subchunk_height // 2) for _ in range(subchunk_count)]
+    unknown_block_data = b"\x00" * (width * depth * subchunk_height)
     max_y = subchunk_count * subchunk_height
     for y in range(max_y):
         sub = y // subchunk_height
@@ -176,17 +243,24 @@ def chunk_block_payload(java_chunk, inverse_block_map: dict) -> bytes:
         for z in range(depth):
             for x in range(width):
                 block = java_chunk.get_block(x, y, z)
-                idx = (local_y * depth + z) * width + x
                 key = block_key(block)
-                block_id = inverse_block_map.get(key, 0)
-                block_id &= 0xFF
-                subchunk_blocks[sub][idx] = block_id
+                block_id, block_data = inverse_block_map.get(key, (0, 0))
+                position = x * 16 * 16 + z * 16 + local_y
+                blocks[sub][position] = block_id & 0xFF
+                meta_index = position // 2
+                if position % 2 == 0:
+                    metas[sub][meta_index] = (metas[sub][meta_index] & 0xF0) | (block_data & 0x0F)
+                else:
+                    metas[sub][meta_index] = (metas[sub][meta_index] & 0x0F) | (
+                        (block_data & 0x0F) << 4
+                    )
     out = bytearray()
     out.append(subchunk_count)
-    for blocks in subchunk_blocks:
+    for sub in range(subchunk_count):
         out.append(0)
-        out.extend(blocks)
-        out.extend(b"\x00" * (width * depth))
+        out.extend(blocks[sub])
+        out.extend(metas[sub])
+        out.extend(unknown_block_data)
     return bytes(out)
 
 
@@ -221,6 +295,8 @@ def _convert_chunk(
     if region.chunk_location(local_x, local_z) == (0, 0):
         return None
     chunk = region.get_chunk(local_x, local_z)
+    if _INVERSE_BLOCK_MAP is None:
+        raise RuntimeError("inverse block map not initialized")
     payload = chunk_block_payload(chunk, _INVERSE_BLOCK_MAP)
     chunk_x = region_x * 32 + local_x
     chunk_z = region_z * 32 + local_z
@@ -278,27 +354,33 @@ def iter_java_chunks(java_world: Path):
 def convert_java(java_world: Path, world_out: Path, delete_out: bool) -> None:
     if world_out.exists():
         if delete_out:
-            for child in world_out.iterdir():
-                if child.is_file():
-                    child.unlink()
-                else:
-                    shutil.rmtree(child)
+            shutil.rmtree(world_out)
         else:
             raise FileExistsError(
                 "output directory already exists, pass --delete-out to overwrite",
             )
     world_out.mkdir(parents=True, exist_ok=True)
+    db_dir = world_out / "db"
+    cdb_dir = db_dir / "cdb"
+    vdb_dir = db_dir / "vdb"
+    db_dir.mkdir(exist_ok=True)
+    cdb_dir.mkdir(exist_ok=True)
+    vdb_dir.mkdir(exist_ok=True)
+    (db_dir / "savemarker").touch(exist_ok=True)
+    for placeholder in (world_out / "level.dat", world_out / "level.dat_old"):
+        if not placeholder.exists():
+            placeholder.write_bytes(b"\x00" * 8)
+
     with open(Path(__file__).parent / "data" / "blocks.json") as blocks_file:
         raw_blocks = json.load(blocks_file)
-    blocks = parse_block_json(raw_blocks)
-    inverse_block_map = build_inverse_block_map(blocks)
-    cdb_output = world_out / "db" / "cdb"
-    builder = CdbBuilder(cdb_output, (7, 0))
+    inverse_block_map = build_inverse_block_map(raw_blocks)
+    builder = CdbWorldBuilder()
     converted_chunks = 0
     missing_xpos_chunks = 0
     max_workers = max(1, (os.cpu_count() or 1) - 1)
     logger.info("Using %d worker process(es) for Java chunk conversion", max_workers)
     if max_workers == 1:
+        _init_chunk_worker(inverse_block_map)
         for (
             region_file,
             region_x,
@@ -370,7 +452,7 @@ def convert_java(java_world: Path, world_out: Path, delete_out: bool) -> None:
                 chunk_x, chunk_z, dimension, payload = result
                 builder.add_chunk(chunk_x, chunk_z, dimension, payload)
                 converted_chunks += 1
-    builder.write()
+    builder.write(world_out)
     if converted_chunks == 0 and missing_xpos_chunks > 0:
         logger.error(
             "Conversion failed: all %d chunks were skipped because they were missing an xPos tag",
