@@ -19,6 +19,8 @@ qgAAALvM3e4= - Another World
 
 Choose the world that you want to convert.  For example, if you want to extract `My World`, run `3dschunker EgAAADRWeJA=`.  If successful, the `Converted` folder should be made, copy this to Minecraft Java Edition 1.16.5 and enjoy!
 
+To go the other direction (Java Edition to 3DS Edition), point `3dschunker` at a Java world folder and pass `--java-to-3ds`.
+
 ### FAQ
 
 **Q:** Can you convert a world from Java Edition to 3DS?  
