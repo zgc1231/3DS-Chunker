@@ -23,6 +23,8 @@ CHUNK_HEADER_SIZE = 0x6C
 DEFAULT_SUBFILE_SIZE = 0x2800
 DEFAULT_POINTER_COUNT = 28
 DEFAULT_INDEX_UNKNOWN0 = 0x3E04
+MAX_SLOT_SIZE_KB = 1281
+MAX_SLOT_SIZE_BYTES = MAX_SLOT_SIZE_KB * 1024
 
 _INVERSE_BLOCK_MAP: dict | None = None
 
@@ -87,6 +89,9 @@ class CdbSlotBuilder:
         self.subfile_size = subfile_size
         self.header_size = header_size
         self.subfiles: list[bytes] = []
+
+    def projected_size_with(self, additional_subfiles: int = 0) -> int:
+        return self.header_size + (len(self.subfiles) + additional_subfiles) * self.subfile_size
 
     def add_chunk(
         self, position: int, parameters: tuple[int, int], compressed: bytes, decompressed: int
@@ -202,16 +207,30 @@ class CdbWorldBuilder:
         subfile_size: int = DEFAULT_SUBFILE_SIZE,
         pointer_count: int = DEFAULT_POINTER_COUNT,
         chunk_parameters: tuple[int, int] = (7, 0),
+        max_slot_size_bytes: int = MAX_SLOT_SIZE_BYTES,
     ) -> None:
         self.subfile_size = subfile_size
         self.chunk_parameters = chunk_parameters
+        self.max_slot_size_bytes = max_slot_size_bytes
         self.slots: dict[int, CdbSlotBuilder] = {}
         self.index_builder = CdbIndexBuilder(pointer_count)
 
+    def _current_slot(self) -> CdbSlotBuilder:
+        if not self.slots:
+            slot_index = 0
+            self.slots[slot_index] = CdbSlotBuilder(slot_index, self.subfile_size)
+        slot_index = max(self.slots)
+        slot = self.slots[slot_index]
+        if slot.projected_size_with(1) > self.max_slot_size_bytes:
+            slot_index += 1
+            slot = CdbSlotBuilder(slot_index, self.subfile_size)
+            self.slots[slot_index] = slot
+        return slot
+
     def add_chunk(self, x: int, z: int, dimension: int, payload: bytes) -> None:
         position = pos_pack(x, z, dimension)
-        slot_index = 0
-        slot = self.slots.setdefault(slot_index, CdbSlotBuilder(slot_index, self.subfile_size))
+        slot = self._current_slot()
+        slot_index = slot.slot_index
         compressed = zlib.compress(payload)
         subfile_index = slot.add_chunk(position, self.chunk_parameters, compressed, len(payload))
         self.index_builder.add_entry(position, slot_index, subfile_index, self.chunk_parameters)
