@@ -275,12 +275,33 @@ def iter_java_chunks(java_world: Path):
             for local_z in range(32):
                 if region.chunk_location(local_x, local_z) == (0, 0):
                     continue
-                chunk = region.get_chunk(local_x, local_z)
+                try:
+                    chunk = region.get_chunk(local_x, local_z)
+                except KeyError as exc:
+                    if "xPos" in str(exc):
+                        logger.debug(
+                            "Skipping chunk (%d, %d) in region (%d, %d) due to missing xPos",
+                            local_x,
+                            local_z,
+                            region_x,
+                            region_z,
+                        )
+                        yield (
+                            None,
+                            region_x * 32 + local_x,
+                            region_z * 32 + local_z,
+                            OVERWORLD,
+                            False,
+                        )
+                        continue
+                    raise
+
                 yield (
                     chunk,
                     region_x * 32 + local_x,
                     region_z * 32 + local_z,
                     OVERWORLD,
+                    True,
                 )
 
 
@@ -304,8 +325,24 @@ def convert_java(java_world: Path, world_out: Path, delete_out: bool) -> None:
     cdb_output = world_out / "db" / "cdb"
     builder = CdbBuilder(cdb_output, (7, 0))
 
-    for chunk, chunk_x, chunk_z, dimension in iter_java_chunks(java_world):
+    converted_chunks = 0
+    missing_xpos_chunks = 0
+
+    for chunk, chunk_x, chunk_z, dimension, has_xpos in iter_java_chunks(java_world):
+        if not has_xpos:
+            missing_xpos_chunks += 1
+            continue
+
         payload = chunk_block_payload(chunk, inverse_block_map)
         builder.add_chunk(chunk_x, chunk_z, dimension, payload)
+        converted_chunks += 1
 
     builder.write()
+
+    if converted_chunks == 0 and missing_xpos_chunks > 0:
+        logger.error(
+            "Conversion failed: all %d chunks were skipped because they were missing an xPos tag",
+            missing_xpos_chunks,
+        )
+
+    logger.info("Conversion complete: %d chunks converted", converted_chunks)
