@@ -83,8 +83,11 @@ def main(
         logger.warning('already extracted, please move or delete the "out" folder')
         sys.exit(1)
 
-    world = World(path)
-    logger.info(f"World name: {world.name}")
+    world = None
+    if mode in {"convert", "extract"}:
+        world = World(path)
+        logger.info(f"World name: {world.name}")
+
     if mode == "convert":
         convert(world, blank_world, world_out, delete_out)
         total_time = time.time() - start_time

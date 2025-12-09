@@ -242,9 +242,29 @@ class CdbBuilder:
         self._write_index()
 
 
+def resolve_region_path(java_world: Path) -> Path:
+    """Return the directory containing Java region files.
+
+    Accept either a world root containing a ``region`` folder or a direct path
+    to the region folder itself.
+    """
+
+    region_dir = java_world / "region"
+    if region_dir.is_dir():
+        return region_dir
+
+    if java_world.is_dir() and any(java_world.glob("r.*.*.mca")):
+        return java_world
+
+    raise FileNotFoundError(
+        f"No region folder found under {java_world!s}; provide a world root or region directory"
+    )
+
+
 def iter_java_chunks(java_world: Path):
     region_pattern = re.compile(r"r\.(-?\d+)\.(-?\d+)\.mca")
-    for region_file in (java_world / "region").glob("r.*.*.mca"):
+    region_dir = resolve_region_path(java_world)
+    for region_file in region_dir.glob("r.*.*.mca"):
         match = region_pattern.fullmatch(region_file.name)
         if match is None:
             continue
