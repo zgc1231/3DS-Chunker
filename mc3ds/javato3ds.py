@@ -30,6 +30,8 @@ def pos_pack(x: int, z: int, dim: int) -> int:
 
 def block_key(block: Block) -> tuple[str, str, tuple[tuple[str, str], ...]]:
     block_id = getattr(block, "id", "")
+    if not isinstance(block_id, str):
+        block_id = str(block_id)
     if ":" in block_id:
         namespace, name = block_id.split(":", 1)
     else:
