@@ -1,6 +1,5 @@
-```c
-#pragma once
-#include <stdint.h>
+// #pragma once
+// #include <stdint.h>
 
 /*
     all-in-one header for Minecraft 3DS world files
@@ -16,7 +15,7 @@
 #define MAGIC_CDB 0xABCDEF98
 #define MAGIC_VDB 0xABCDEF99
 
-#pragma pack(push, 1)
+// #pragma pack(push, 1)
 
 /* --------------------------------------------------
    SHARED CONTAINER HEADER (sltXX.cdb / sltXX.vdb)
@@ -59,11 +58,11 @@ struct Position {
 };
 
 /* tiny helper, optional in your code */
-static inline uint32_t pos_pack(int x, int z, int dim) {
-    return ((uint32_t)(x & 0x3FFF))
-         | ((uint32_t)(z & 0x3FFF) << 14)
-         | ((uint32_t)(dim & 0xF)  << 28);
-}
+// static inline uint32_t pos_pack(int x, int z, int dim) {
+//     return ((uint32_t)(x & 0x3FFF))
+//          | ((uint32_t)(z & 0x3FFF) << 14)
+//          | ((uint32_t)(dim & 0xF)  << 28);
+// }
 
 
 /* --------------------------------------
@@ -351,5 +350,4 @@ struct VdbIndexEntry {
        names match keys exactly.
 */
 
-#pragma pack(pop)
-```
+// #pragma pack(pop)

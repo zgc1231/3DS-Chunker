@@ -83,15 +83,17 @@ def main(
         logger.warning('already extracted, please move or delete the "out" folder')
         sys.exit(1)
 
-    world = World(path)
-    logger.info(f"World name: {world.name}")
     if mode == "convert":
+        world = World(path)
+        logger.info(f"World name: {world.name}")
         convert(world, blank_world, world_out, delete_out)
         total_time = time.time() - start_time
         minutes = int(total_time // 60)
         seconds = total_time % 60
         logger.info(f"conversion time is {minutes:02d}:{seconds:05.2f}")
     elif mode == "extract":
+        world = World(path)
+        logger.info(f"World name: {world.name}")
         if out.exists() and delete_out:
             if (out / "3dschunker.txt").is_file():
                 shutil.rmtree(out)
