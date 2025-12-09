@@ -29,157 +29,47 @@ def pos_pack(x: int, z: int, dim: int) -> int:
 
 
 def block_key(block: Block) -> tuple[str, str, tuple[tuple[str, str], ...]]:
-    properties = tuple(sorted((block.properties or {}).items()))
-    return block.namespace, block.id, properties
+    block_id = getattr(block, "id", "")
+    if ":" in block_id:
+        namespace, name = block_id.split(":", 1)
+    else:
+        namespace, name = "minecraft", block_id
+    props = getattr(block, "properties", None)
+    if not isinstance(props, dict):
+        props_dict = {}
+    else:
+        props_dict = props
+    properties = tuple(sorted(props_dict.items()))
+    return namespace, name, properties
 
 
-def build_inverse_block_map(blocks: dict[tuple[int, int], Block]) -> dict:
-    inverse = {}
-    for block_id, block in blocks.items():
-        inverse[block_key(block)] = block_id
+def build_inverse_block_map(blocks: dict) -> dict:
+    inverse: dict[tuple[str, str, tuple[tuple[str, str], ...]], int] = {}
+    for _id, block_def in blocks.items():
+        if isinstance(block_def, dict):
+            namespace = block_def.get("namespace")
+            name = block_def.get("name")
+            variants = block_def.get("variants", [])
+        else:
+            namespace = getattr(block_def, "namespace", None)
+            name = getattr(block_def, "name", None)
+            variants = getattr(block_def, "variants", [])
+        if not namespace or not name:
+            continue
+        for variant in variants:
+            if isinstance(variant, dict):
+                props = variant.get("properties", {})
+                var_id = variant.get("id")
+            else:
+                props = getattr(variant, "properties", {}) or {}
+                var_id = getattr(variant, "id", None)
+            if var_id is None:
+                continue
+            key = (namespace, name, tuple(sorted(props.items())))
+            if key in inverse:
+                continue
+            inverse[key] = var_id
     return inverse
-
-
-def align(value: int, multiple: int = 0x10) -> int:
-    return (value + multiple - 1) // multiple * multiple
-
-
-def pack_chunk_header(
-    chunk_x: int,
-    chunk_z: int,
-    dimension: int,
-    chunk_status: tuple[int, int],
-    section_offset: int,
-    compressed_size: int,
-    decompressed_size: int,
-) -> bytes:
-    header = bytearray()
-    header.extend(
-        struct.pack(
-            "<IbbHHH",
-            pos_pack(chunk_x, chunk_z, dimension),
-            chunk_status[0],
-            chunk_status[1],
-            0,
-            3,
-            0,
-        )
-    )
-    # first section contains the block data blob
-    header.extend(
-        struct.pack(
-            "<iiii",
-            0,
-            section_offset,
-            compressed_size,
-            decompressed_size,
-        )
-    )
-    # remaining unused sections
-    for _ in range(5):
-        header.extend(struct.pack("<iiii", -1, -1, 0, 0))
-    return bytes(header)
-
-
-def pack_cdb_entry(
-    chunk_x: int,
-    chunk_z: int,
-    dimension: int,
-    slot: int,
-    subfile: int,
-    chunk_status: tuple[int, int],
-) -> bytes:
-    return struct.pack(
-        "<IHHHHbbH",
-        pos_pack(chunk_x, chunk_z, dimension),
-        slot,
-        subfile,
-        0x20FF,
-        0x000A,
-        chunk_status[0],
-        chunk_status[1],
-        0x8000,
-    )
-
-
-def pack_file_header(subfile_count: int, subfile_size: int) -> bytes:
-    return struct.pack("<HHIIII", 1, 1, subfile_count, FILE_HEADER_SIZE, subfile_size, 0x4)
-
-
-def pack_index(
-    entries: list[bytes],
-    pointer_count: int = 1,
-    unknown0: int = 0x3E04,
-) -> bytes:
-    header = struct.pack(
-        "<IIIIII",
-        0x2,
-        len(entries),
-        unknown0,
-        0x10,
-        pointer_count,
-        0x80,
-    )
-    pointers = b"".join(struct.pack("<I", i) for i in range(pointer_count))
-    return header + pointers + b"".join(entries)
-
-
-def chunk_block_payload(java_chunk, inverse_block_map: dict) -> bytes:
-    subchunks: list[bytes] = []
-    highest_present = -1
-    for subchunk_index in range(8):
-        blocks = bytearray(16 * 16 * 16)
-        block_data = bytearray(16 * 16 * 16 // 2)
-        unknown_block_data = bytearray(16 * 16 * 16)
-        has_blocks = False
-
-        for x in range(16):
-            for z in range(16):
-                for y in range(16):
-                    world_y = subchunk_index * 16 + y
-                    block = java_chunk.get_block(x, world_y, z)
-                    mapped = inverse_block_map.get(block_key(block))
-                    if mapped is None:
-                        mapped = (0, 0)
-                    block_id, block_meta = mapped
-                    index = x * 16 * 16 + z * 16 + y
-                    blocks[index] = block_id
-                    if index % 2 == 0:
-                        block_data[index // 2] |= block_meta & 0xF
-                    else:
-                        block_data[index // 2] |= (block_meta & 0xF) << 4
-                    if block_id or block_meta:
-                        has_blocks = True
-
-        if has_blocks:
-            highest_present = subchunk_index
-
-        payload = bytearray()
-        payload.append(0)
-        payload.extend(blocks)
-        payload.extend(block_data)
-        payload.extend(unknown_block_data)
-        subchunks.append(bytes(payload))
-
-    subchunk_count = highest_present + 1
-    data = bytearray()
-    data.append(subchunk_count)
-    for subchunk_index in range(subchunk_count):
-        data.extend(subchunks[subchunk_index])
-    # heightmap + biomes placeholders
-    data.extend(b"\0" * (16 * 16 * 2))
-    data.extend(b"\0" * (16 * 16))
-    return bytes(data)
-
-
-def _init_chunk_worker(inverse_block_map: dict) -> None:
-    global _INVERSE_BLOCK_MAP
-    _INVERSE_BLOCK_MAP = inverse_block_map
-
-
-def _convert_chunk(java_chunk, chunk_x: int, chunk_z: int, dimension: int):
-    payload = chunk_block_payload(java_chunk, _INVERSE_BLOCK_MAP)
-    return chunk_x, chunk_z, dimension, payload
 
 
 class CdbBuilder:
@@ -188,89 +78,151 @@ class CdbBuilder:
         self.chunk_status = chunk_status
         self.entries: list[bytes] = []
         self.chunk_blobs: list[tuple[bytes, int]] = []
-        self.chunk_positions: list[tuple[int, int, int]] = []
-        self.max_subfile_size = 0
+        self._index_by_position: dict[int, int] = {}
 
-    def add_chunk(self, chunk_x: int, chunk_z: int, dimension: int, payload: bytes) -> None:
+    def add_chunk(self, x: int, z: int, dimension: int, payload: bytes) -> None:
+        pos = pos_pack(x, z, dimension)
+        if pos in self._index_by_position:
+            raise ValueError(f"chunk at position {x}, {z}, {dimension} already added")
+        index = len(self.entries)
+        self._index_by_position[pos] = index
+        header = bytearray(CHUNK_HEADER_SIZE)
+        struct.pack_into("<I", header, 0x0, pos)
+        struct.pack_into("<I", header, 0x4, 0)
+        struct.pack_into("<I", header, 0x8, 0)
+        struct.pack_into("<I", header, 0xC, 0)
+        struct.pack_into("<I", header, 0x10, 0)
+        struct.pack_into("<I", header, 0x14, 0)
+        struct.pack_into("<I", header, 0x18, 0)
+        struct.pack_into("<I", header, 0x1C, 0)
+        struct.pack_into("<I", header, 0x20, 0)
+        struct.pack_into("<I", header, 0x24, 0)
+        struct.pack_into("<I", header, 0x28, 0)
+        struct.pack_into("<I", header, 0x2C, 0)
+        struct.pack_into("<I", header, 0x30, 3)
+        struct.pack_into("<I", header, 0x34, self.chunk_status[0])
+        struct.pack_into("<I", header, 0x38, self.chunk_status[1])
+        struct.pack_into("<I", header, 0x3C, 0)
+        struct.pack_into("<I", header, 0x40, 0)
+        struct.pack_into("<I", header, 0x44, 0)
+        struct.pack_into("<I", header, 0x48, 0)
+        struct.pack_into("<I", header, 0x4C, 0)
+        struct.pack_into("<I", header, 0x50, 0)
+        struct.pack_into("<I", header, 0x54, 0)
+        struct.pack_into("<I", header, 0x58, 0)
+        struct.pack_into("<I", header, 0x5C, 0)
+        struct.pack_into("<I", header, 0x60, 0)
+        struct.pack_into("<I", header, 0x64, 0)
+        struct.pack_into("<I", header, 0x68, 0)
         compressed = zlib.compress(payload)
-        subfile_min_size = (
-            len(compressed) + CHUNK_HEADER_SIZE + struct.calcsize("<I")
-        )
-        self.max_subfile_size = max(self.max_subfile_size, subfile_min_size)
+        self.entries.append(bytes(header))
         self.chunk_blobs.append((compressed, len(payload)))
-        self.chunk_positions.append((chunk_x, chunk_z, dimension))
-        subfile_index = len(self.chunk_blobs) - 1
-        self.entries.append(
-            pack_cdb_entry(
-                chunk_x,
-                chunk_z,
-                dimension,
-                0,
-                subfile_index,
-                self.chunk_status,
-            )
-        )
-
-    def _write_slot(self, subfile_size: int) -> None:
-        slot_path = self.output_directory / "slt0.cdb"
-        slot_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(slot_path, "wb") as slot_file:
-            slot_file.write(pack_file_header(len(self.chunk_blobs), subfile_size))
-            for (compressed_blob, decompressed_size), position in zip(
-                self.chunk_blobs, self.chunk_positions
-            ):
-                section_offset = len(struct.pack("<I", MAGIC_CDB)) + CHUNK_HEADER_SIZE
-                chunk_header = pack_chunk_header(
-                    position[0],
-                    position[1],
-                    position[2],
-                    self.chunk_status,
-                    section_offset,
-                    len(compressed_blob),
-                    decompressed_size,
-                )
-                subfile = bytearray()
-                subfile.extend(struct.pack("<I", MAGIC_CDB))
-                subfile.extend(chunk_header)
-                subfile.extend(compressed_blob)
-                padding = subfile_size - len(subfile)
-                if padding < 0:
-                    raise ValueError("subfile size too small for chunk data")
-                subfile.extend(b"\0" * padding)
-                slot_file.write(subfile)
-
-    def _write_index(self) -> None:
-        index_bytes = pack_index(self.entries)
-        for index_name in ("index.cdb", "newindex.cdb"):
-            with open(self.output_directory / index_name, "wb") as index_file:
-                index_file.write(index_bytes)
 
     def write(self) -> None:
-        if not self.chunk_blobs:
-            logger.warning("No chunks to write to CDB output")
-            return
-        subfile_size = align(max(self.max_subfile_size, DEFAULT_SUBFILE_SIZE))
-        self._write_slot(subfile_size)
-        self._write_index()
+        self.output_directory.mkdir(parents=True, exist_ok=True)
+        output_path = self.output_directory / "0.cdb"
+        with open(output_path, "wb") as out:
+            self._write_file(out)
+
+    def _write_file(self, out) -> None:
+        entries_offset = FILE_HEADER_SIZE
+        chunks_offset = FILE_HEADER_SIZE + CHUNK_HEADER_SIZE * len(self.entries)
+        out.seek(0)
+        out.write(b"\x00" * FILE_HEADER_SIZE)
+        out.seek(entries_offset)
+        for entry in self.entries:
+            out.write(entry)
+        out.seek(chunks_offset)
+        chunk_offsets: list[tuple[int, int, int]] = []
+        for blob, uncompressed_size in self.chunk_blobs:
+            offset = out.tell()
+            out.write(blob)
+            size = out.tell() - offset
+            if size > 0xFFFFFFFF or offset > 0xFFFFFFFF:
+                raise ValueError("chunk data too large to write to cdb")
+            chunk_offsets.append((offset, size, uncompressed_size))
+        out.seek(0, os.SEEK_END)
+        file_size = out.tell()
+        header = bytearray(FILE_HEADER_SIZE)
+        struct.pack_into("<I", header, 0x0, MAGIC_CDB)
+        struct.pack_into("<I", header, 0x4, file_size)
+        struct.pack_into("<I", header, 0x8, 1)
+        struct.pack_into("<I", header, 0xC, 1)
+        struct.pack_into("<I", header, 0x10, len(self.entries))
+        out.seek(0)
+        out.write(header)
+        out.seek(FILE_HEADER_SIZE)
+        for i, entry in enumerate(self.entries):
+            offset, size, uncompressed_size = chunk_offsets[i]
+            patched = bytearray(entry)
+            struct.pack_into("<I", patched, 0x4, offset)
+            struct.pack_into("<I", patched, 0x8, size)
+            struct.pack_into("<I", patched, 0xC, uncompressed_size)
+            out.write(patched)
+
+
+def chunk_block_payload(java_chunk, inverse_block_map: dict) -> bytes:
+    subchunk_count = 8
+    subchunk_height = 16
+    width = 16
+    depth = 16
+    subchunk_blocks = [bytearray(width * depth * subchunk_height) for _ in range(subchunk_count)]
+    max_y = subchunk_count * subchunk_height
+    for y in range(max_y):
+        sub = y // subchunk_height
+        local_y = y % subchunk_height
+        for z in range(depth):
+            for x in range(width):
+                block = java_chunk.get_block(x, y, z)
+                idx = (local_y * depth + z) * width + x
+                key = block_key(block)
+                block_id = inverse_block_map.get(key, 0)
+                block_id &= 0xFF
+                subchunk_blocks[sub][idx] = block_id
+    out = bytearray()
+    out.append(subchunk_count)
+    for blocks in subchunk_blocks:
+        out.append(0)
+        out.extend(blocks)
+        out.extend(b"\x00" * (width * depth))
+    return bytes(out)
 
 
 def resolve_region_path(java_world: Path) -> Path:
-    """Return the directory containing Java region files.
+    java_world = Path(java_world)
+    candidates = [
+        java_world / "region",
+        java_world / "DIM0" / "region",
+        java_world,
+    ]
+    for candidate in candidates:
+        if candidate.is_dir() and list(candidate.glob("r.*.*.mca")):
+            return candidate
+    raise FileNotFoundError(f"could not find region directory under {java_world!r}")
 
-    Accept either a world root containing a ``region`` folder or a direct path
-    to the region folder itself.
-    """
 
-    region_dir = java_world / "region"
-    if region_dir.is_dir():
-        return region_dir
+def _init_chunk_worker(inverse_block_map: dict) -> None:
+    global _INVERSE_BLOCK_MAP
+    _INVERSE_BLOCK_MAP = inverse_block_map
 
-    if java_world.is_dir() and any(java_world.glob("r.*.*.mca")):
-        return java_world
 
-    raise FileNotFoundError(
-        f"No region folder found under {java_world!s}; provide a world root or region directory"
-    )
+def _convert_chunk(
+    region_file: Path,
+    region_x: int,
+    region_z: int,
+    local_x: int,
+    local_z: int,
+    dimension: int,
+):
+    with open(region_file, "rb") as region_handle:
+        region = Region.from_file(region_handle)
+    if region.chunk_location(local_x, local_z) == (0, 0):
+        return None
+    chunk = region.get_chunk(local_x, local_z)
+    payload = chunk_block_payload(chunk, _INVERSE_BLOCK_MAP)
+    chunk_x = region_x * 32 + local_x
+    chunk_z = region_z * 32 + local_z
+    return chunk_x, chunk_z, dimension, payload
 
 
 def iter_java_chunks(java_world: Path):
@@ -288,30 +240,34 @@ def iter_java_chunks(java_world: Path):
                 if region.chunk_location(local_x, local_z) == (0, 0):
                     continue
                 try:
-                    chunk = region.get_chunk(local_x, local_z)
+                    region.get_chunk(local_x, local_z)
                 except KeyError as exc:
-                    if "xPos" in str(exc):
+                    msg = str(exc)
+                    if "xPos" in msg or "Level" in msg:
                         logger.debug(
-                            "Skipping chunk (%d, %d) in region (%d, %d) due to missing xPos",
+                            "Skipping chunk (%d, %d) in region (%d, %d) due to missing xPos/Level",
                             local_x,
                             local_z,
                             region_x,
                             region_z,
                         )
                         yield (
-                            None,
-                            region_x * 32 + local_x,
-                            region_z * 32 + local_z,
+                            region_file,
+                            region_x,
+                            region_z,
+                            local_x,
+                            local_z,
                             OVERWORLD,
                             False,
                         )
                         continue
                     raise
-
                 yield (
-                    chunk,
-                    region_x * 32 + local_x,
-                    region_z * 32 + local_z,
+                    region_file,
+                    region_x,
+                    region_z,
+                    local_x,
+                    local_z,
                     OVERWORLD,
                     True,
                 )
@@ -326,68 +282,96 @@ def convert_java(java_world: Path, world_out: Path, delete_out: bool) -> None:
                 else:
                     shutil.rmtree(child)
         else:
-            raise FileExistsError("output directory already exists, pass --delete-out to overwrite")
+            raise FileExistsError(
+                "output directory already exists, pass --delete-out to overwrite",
+            )
     world_out.mkdir(parents=True, exist_ok=True)
-
     with open(Path(__file__).parent / "data" / "blocks.json") as blocks_file:
         raw_blocks = json.load(blocks_file)
     blocks = parse_block_json(raw_blocks)
     inverse_block_map = build_inverse_block_map(blocks)
-
     cdb_output = world_out / "db" / "cdb"
     builder = CdbBuilder(cdb_output, (7, 0))
-
     converted_chunks = 0
     missing_xpos_chunks = 0
-
     max_workers = max(1, (os.cpu_count() or 1) - 1)
     logger.info("Using %d worker process(es) for Java chunk conversion", max_workers)
-
     if max_workers == 1:
-        for chunk, chunk_x, chunk_z, dimension, has_xpos in iter_java_chunks(java_world):
+        for (
+            region_file,
+            region_x,
+            region_z,
+            local_x,
+            local_z,
+            dimension,
+            has_xpos,
+        ) in iter_java_chunks(java_world):
             if not has_xpos:
                 missing_xpos_chunks += 1
                 continue
-
-            payload = chunk_block_payload(chunk, inverse_block_map)
+            result = _convert_chunk(
+                region_file,
+                region_x,
+                region_z,
+                local_x,
+                local_z,
+                dimension,
+            )
+            if result is None:
+                continue
+            chunk_x, chunk_z, dimension, payload = result
             builder.add_chunk(chunk_x, chunk_z, dimension, payload)
             converted_chunks += 1
     else:
         max_in_flight = max_workers * 4
         futures = set()
-
         with ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=_init_chunk_worker,
             initargs=(inverse_block_map,),
         ) as executor:
-            for chunk, chunk_x, chunk_z, dimension, has_xpos in iter_java_chunks(java_world):
+            for (
+                region_file,
+                region_x,
+                region_z,
+                local_x,
+                local_z,
+                dimension,
+                has_xpos,
+            ) in iter_java_chunks(java_world):
                 if not has_xpos:
                     missing_xpos_chunks += 1
                     continue
-
-                futures.add(
-                    executor.submit(_convert_chunk, chunk, chunk_x, chunk_z, dimension)
+                fut = executor.submit(
+                    _convert_chunk,
+                    region_file,
+                    region_x,
+                    region_z,
+                    local_x,
+                    local_z,
+                    dimension,
                 )
-
+                futures.add(fut)
                 if len(futures) >= max_in_flight:
                     done = next(as_completed(futures))
                     futures.remove(done)
-                    chunk_x, chunk_z, dimension, payload = done.result()
+                    result = done.result()
+                    if result is None:
+                        continue
+                    chunk_x, chunk_z, dimension, payload = result
                     builder.add_chunk(chunk_x, chunk_z, dimension, payload)
                     converted_chunks += 1
-
             for done in as_completed(futures):
-                chunk_x, chunk_z, dimension, payload = done.result()
+                result = done.result()
+                if result is None:
+                    continue
+                chunk_x, chunk_z, dimension, payload = result
                 builder.add_chunk(chunk_x, chunk_z, dimension, payload)
                 converted_chunks += 1
-
     builder.write()
-
     if converted_chunks == 0 and missing_xpos_chunks > 0:
         logger.error(
             "Conversion failed: all %d chunks were skipped because they were missing an xPos tag",
             missing_xpos_chunks,
         )
-
     logger.info("Conversion complete: %d chunks converted", converted_chunks)
